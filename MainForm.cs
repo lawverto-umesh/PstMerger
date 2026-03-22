@@ -11,6 +11,7 @@ namespace PstMerger
         private PstService _pstService;
         private System.Threading.CancellationTokenSource _cts;
         private string _logFile;
+        private bool _skipDuplicateChecking;
 
         public MainForm(bool skipDuplicateChecking = false)
         {
@@ -233,9 +234,8 @@ namespace PstMerger
                         }
                         if (progress == -3)
                         {
-                            // Log skipped items to both main log and current copy status
+                            // Log skipped items to main log only, don't clutter current copy window
                             Log(message);
-                            SetCurrentCopyStatus(message);
                             return;
                         }
 

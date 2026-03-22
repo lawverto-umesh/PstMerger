@@ -62,6 +62,72 @@ namespace PstMerger
             }
         }
 
+        private Outlook.Application InitializeOutlookWithRetry(Action<int, string> onProgress, System.Threading.CancellationToken ct)
+        {
+            const int maxRetries = 5;
+            const int initialDelayMs = 2000; // Start with 2 seconds
+            const int maxDelayMs = 10000; // Max 10 seconds between retries
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                if (ct.IsCancellationRequested)
+                    throw new OperationCanceledException("Outlook initialization cancelled");
+
+                try
+                {
+                    onProgress(-1, string.Format("Initializing Outlook (attempt {0}/{1})...", attempt, maxRetries));
+
+                    // Create Outlook application
+                    Outlook.Application outlookApp = new Outlook.Application();
+
+                    // Give Outlook time to initialize
+                    System.Threading.Thread.Sleep(1000);
+
+                    // Try to get namespace - this is where RPC_E_SERVERCALL_RETRYLATER can occur
+                    Outlook.NameSpace ns = outlookApp.GetNamespace("MAPI");
+
+                    // If we get here, initialization was successful
+                    onProgress(-1, "Outlook initialized successfully");
+                    return outlookApp;
+                }
+                catch (COMException comEx)
+                {
+                    if ((uint)comEx.ErrorCode == 0x8001010A) // RPC_E_SERVERCALL_RETRYLATER
+                    {
+                        if (attempt == maxRetries)
+                        {
+                            throw new Exception(string.Format("Outlook is busy after {0} attempts. Please ensure Outlook is not running and try again.", maxRetries), comEx);
+                        }
+
+                        int delayMs = Math.Min(initialDelayMs * attempt, maxDelayMs);
+                        onProgress(-1, string.Format("Outlook is busy (RPC_E_SERVERCALL_RETRYLATER). Retrying in {0}ms...", delayMs));
+
+                        try
+                        {
+                            System.Threading.Thread.Sleep(delayMs);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                    }
+                    else
+                    {
+                        // For other COM exceptions, don't retry
+                        throw new Exception(string.Format("Failed to initialize Outlook: {0}", comEx.Message), comEx);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // For other exceptions, don't retry
+                    throw new Exception(string.Format("Failed to initialize Outlook: {0}", ex.Message), ex);
+                }
+            }
+
+            // This should never be reached, but satisfies compiler
+            throw new Exception("Failed to initialize Outlook after all retry attempts");
+        }
+
         public async Task MergeFilesAsync(string[] sourceFiles, string destinationPst, System.Threading.CancellationToken ct, Action<int, string> onProgress, bool skipDuplicateChecking = false)
         {
             // Initialize performance tracking
@@ -80,8 +146,8 @@ namespace PstMerger
 
             try
             {
-                // Create Outlook application (assuming we're already on STA thread)
-                outlookApp = new Outlook.Application();
+                // Initialize Outlook with retry logic to handle RPC_E_SERVERCALL_RETRYLATER
+                outlookApp = InitializeOutlookWithRetry(onProgress, ct);
                 ns = outlookApp.GetNamespace("MAPI");
 
                 if (outlookApp == null || ns == null)
@@ -687,15 +753,7 @@ namespace PstMerger
                                 }
                                 catch (Exception directMoveEx)
                                 {
-                                    // Direct move failed, try alternative strategies
-                                    if (await TryCopyLargeItemAsync(dynItem, destFolder, folderName, itemIndex, currentItem, ct, onProgress))
-                                    {
-                                        copySucceeded = true;
-                                        _totalItemsProcessed++;
-                                        _totalLargeItemsHandled++;
-                                        break;
-                                    }
-                                    // All strategies failed, continue with retry logic
+                                    // Direct move failed, try alternative strategies outside catch block
                                     lastException = oomEx;
                                 }
                             }
@@ -730,6 +788,25 @@ namespace PstMerger
                         }
                         if (delayEx != null && attempt < maxRetries)
                             await Task.Delay(50, ct); // Use async delay outside catch
+                    }
+
+                    // If all retries failed due to OutOfMemoryException, try alternative large item strategies
+                    if (!copySucceeded && lastException is OutOfMemoryException)
+                    {
+                        if (await TryCopyLargeItemAsync(dynItem, destFolder, folderName, itemIndex, currentItem, ct, onProgress))
+                        {
+                            copySucceeded = true;
+                            _totalItemsProcessed++;
+                            _totalLargeItemsHandled++;
+                        }
+                        else
+                        {
+                            // All strategies failed for large item
+                            string skipMsg = string.Format("SKIPPED ITEM: #{0} in {1}: {2} (too large to copy with any method)", itemIndex, folderName, currentItem);
+                            onProgress(-3, skipMsg);
+                            _totalItemsSkipped++;
+                            return; // Skip this item
+                        }
                     }
                 }
                 catch (Exception ex)

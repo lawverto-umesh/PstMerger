@@ -64,6 +64,11 @@ Please [Submit an Issue](https://github.com/mithundgnxt-stack/PstMerger/issues) 
 ## Building from Source
 
 ```bash
+## Cleanup
+rm -rf bin/ obj/
+```
+
+```bash
 # Clone the repository
 git clone https://github.com/YourUsername/PstMergeTool.git
 cd PstMergeTool
