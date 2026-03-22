@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using Outlook = Microsoft.Office.Interop.Outlook;
 
 namespace PstMerger
@@ -12,7 +13,11 @@ namespace PstMerger
         [DllImport("ole32.dll")]
         private static extern int CoInitializeSecurity(IntPtr pVoid, int cAuthSvc, IntPtr asAuthSvc, IntPtr pReserved1, uint dwAuthnLevel, uint dwImpLevel, IntPtr pAuthList, uint dwCapabilities, IntPtr pReserved3);
 
-        public void MergeFiles(string[] sourceFiles, string destinationPst, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        // Optimize: Use parallel processing with controlled concurrency
+        private const int MaxConcurrentPstFiles = 3; // Process up to 3 PST files simultaneously
+        private const int MaxConcurrentItemsPerFolder = 5; // Copy up to 5 items concurrently per folder
+
+        public async Task MergeFilesAsync(string[] sourceFiles, string destinationPst, System.Threading.CancellationToken ct, Action<int, string> onProgress)
         {
             // Initialize COM security for Outlook interop
             CoInitializeSecurity(IntPtr.Zero, -1, IntPtr.Zero, IntPtr.Zero, 0, 3, IntPtr.Zero, 0x20, IntPtr.Zero);
@@ -37,7 +42,7 @@ namespace PstMerger
                     try
                     {
                         ns.AddStore(destinationPst);
-                        Thread.Sleep(200); // Minimal delay to let Outlook register the store
+                        await Task.Delay(200, ct); // Use async delay instead of Thread.Sleep
                     }
                     catch (Exception ex)
                     {
@@ -53,7 +58,7 @@ namespace PstMerger
                     try
                     {
                         ns.AddStore(destinationPst);
-                        Thread.Sleep(100); // Minimal delay
+                        await Task.Delay(100, ct);
                     }
                     catch (Exception ex)
                     {
@@ -68,31 +73,24 @@ namespace PstMerger
                 destRoot = GetRootFolder(ns, destinationPst, onProgress);
                 if (destRoot == null) throw new Exception("Could not find destination root folder for: " + destinationPst);
 
-                int count = 0;
-                foreach (string sourceFile in sourceFiles)
+                // OPTIMIZATION: Process PST files in parallel with controlled concurrency
+                var semaphore = new SemaphoreSlim(MaxConcurrentPstFiles);
+                var tasks = new List<Task>();
+
+                for (int i = 0; i < sourceFiles.Length; i++)
                 {
+                    string sourceFile = sourceFiles[i];
                     if (ct.IsCancellationRequested) break;
 
                     // Skip if it's the destination itself
                     if (string.Equals(Path.GetFullPath(sourceFile), Path.GetFullPath(destinationPst), StringComparison.OrdinalIgnoreCase))
                         continue;
 
-                    count++;
-                    onProgress(count, string.Format("Merging: {0}", Path.GetFileName(sourceFile)));
-
-                    try
-                    {
-                        ProcessSourcePst(ns, sourceFile, destRoot, ct, onProgress);
-                    }
-                    catch (Exception ex)
-                    {
-                        string errorMsg = string.Format("Fatal error processing source file {0}: {1}", Path.GetFileName(sourceFile), ex.Message);
-                        if (ex.InnerException != null)
-                            errorMsg += "\nInner error: " + ex.InnerException.Message;
-                        onProgress(-1, errorMsg);
-                        // Don't throw - continue with next file
-                    }
+                    tasks.Add(ProcessSourcePstAsync(ns, sourceFile, destRoot, semaphore, i + 1, ct, onProgress));
                 }
+
+                // Wait for all PST processing tasks to complete
+                await Task.WhenAll(tasks);
 
                 ns.RemoveStore(destRoot);
                 onProgress(100, "Merge process completed");
@@ -136,62 +134,83 @@ namespace PstMerger
             }
         }
 
-        private void ProcessSourcePst(Outlook.NameSpace ns, string filePath, Outlook.Folder destRoot, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        // Keep the old synchronous method for backward compatibility
+        public void MergeFiles(string[] sourceFiles, string destinationPst, System.Threading.CancellationToken ct, Action<int, string> onProgress)
         {
-            Outlook.Folder sourceRoot = null;
+            // Run the async version synchronously
+            var task = MergeFilesAsync(sourceFiles, destinationPst, ct, onProgress);
+            task.GetAwaiter().GetResult();
+        }
+
+        private async Task ProcessSourcePstAsync(Outlook.NameSpace ns, string filePath, Outlook.Folder destRoot, SemaphoreSlim semaphore, int fileIndex, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        {
+            await semaphore.WaitAsync(ct); // Control concurrency
             try
             {
-                // Retry logic for adding store
-                int maxRetries = 2;
-                for (int attempt = 1; attempt <= maxRetries; attempt++)
+                onProgress(fileIndex, string.Format("Merging: {0}", Path.GetFileName(filePath)));
+
+                Outlook.Folder sourceRoot = null;
+                try
                 {
-                    try
+                    // Retry logic for adding store
+                    int maxRetries = 2;
+                    for (int attempt = 1; attempt <= maxRetries; attempt++)
                     {
-                        ns.AddStore(filePath);
-                        Thread.Sleep(50); // Minimal delay to register store
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        bool isAccessDenied = ex.Message.Contains("access") || ex.HResult == -2147024891;
-                        if (attempt == maxRetries)
+                        Exception delayEx = null;
+                        try
                         {
-                            string errorMsg = string.Format("Failed to add store after {0} attempts: {1}", maxRetries, ex.Message);
-                            if (isAccessDenied)
-                                errorMsg += string.Format(" [File: {0}] [HResult: {1}]", filePath, ex.HResult);
-                            if (ex.InnerException != null)
-                                errorMsg += "\nInner: " + ex.InnerException.Message;
-                            throw new Exception(errorMsg, ex);
+                            ns.AddStore(filePath);
+                            await Task.Delay(50, ct); // Use async delay
+                            break;
                         }
-                        
-                        string retryMsg = string.Format("Retry {0}/{1} adding store: {2}", attempt, maxRetries, ex.Message);
-                        if (isAccessDenied)
-                            retryMsg += string.Format(" [File: {0}]", filePath);
-                        onProgress(-1, retryMsg);
-                        Thread.Sleep(100); // Minimal wait before retry
+                        catch (Exception ex)
+                        {
+                            bool isAccessDenied = ex.Message.Contains("access") || ex.HResult == -2147024891;
+                            if (attempt == maxRetries)
+                            {
+                                string errorMsg = string.Format("Failed to add store after {0} attempts: {1}", maxRetries, ex.Message);
+                                if (isAccessDenied)
+                                    errorMsg += string.Format(" [File: {0}] [HResult: {1}]", filePath, ex.HResult);
+                                if (ex.InnerException != null)
+                                    errorMsg += "\nInner: " + ex.InnerException.Message;
+                                throw new Exception(errorMsg, ex);
+                            }
+                            
+                            string retryMsg = string.Format("Retry {0}/{1} adding store: {2}", attempt, maxRetries, ex.Message);
+                            if (isAccessDenied)
+                                retryMsg += string.Format(" [File: {0}]", filePath);
+                            onProgress(-1, retryMsg);
+                            delayEx = ex;
+                        }
+                        if (delayEx != null)
+                            await Task.Delay(100, ct); // Use async delay outside catch
                     }
-                }
 
-                sourceRoot = GetRootFolder(ns, filePath, onProgress);
-                if (sourceRoot == null)
+                    sourceRoot = GetRootFolder(ns, filePath, onProgress);
+                    if (sourceRoot == null)
+                    {
+                        throw new Exception("Could not find root folder for source PST: " + filePath);
+                    }
+
+                    await CopyFoldersAsync(sourceRoot, destRoot, ct, onProgress);
+
+                    try { ns.RemoveStore(sourceRoot); }
+                    catch { }
+                    Marshal.ReleaseComObject(sourceRoot);
+                }
+                catch (Exception ex)
                 {
-                    throw new Exception("Could not find root folder for source PST: " + filePath);
+                    string errorMsg = string.Format("Error processing {0}: {1}", Path.GetFileName(filePath), ex.Message);
+                    if (ex.InnerException != null)
+                        errorMsg += "\n  Caused by: " + ex.InnerException.Message;
+                    if (!string.IsNullOrEmpty(ex.StackTrace))
+                        errorMsg += "\n  Source: " + (ex.Source ?? "unknown");
+                    onProgress(-1, errorMsg);
                 }
-
-                CopyFolders(sourceRoot, destRoot, ct, onProgress);
-
-                try { ns.RemoveStore(sourceRoot); }
-                catch { }
-                Marshal.ReleaseComObject(sourceRoot);
             }
-            catch (Exception ex)
+            finally
             {
-                string errorMsg = string.Format("Error processing {0}: {1}", Path.GetFileName(filePath), ex.Message);
-                if (ex.InnerException != null)
-                    errorMsg += "\n  Caused by: " + ex.InnerException.Message;
-                if (!string.IsNullOrEmpty(ex.StackTrace))
-                    errorMsg += "\n  Source: " + (ex.Source ?? "unknown");
-                onProgress(-1, errorMsg);
+                semaphore.Release();
             }
         }
 
@@ -371,6 +390,213 @@ namespace PstMerger
             }
         }
 
+        private async Task CopyFoldersAsync(Outlook.Folder sourceFolder, Outlook.Folder destFolder, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        {
+            if (ct.IsCancellationRequested) return;
+
+            // 1. Copy items in the current folder with parallel processing
+            Outlook.Items sourceItems = sourceFolder.Items;
+            int itemCount = sourceItems.Count;
+
+            if (itemCount > 0)
+            {
+                // OPTIMIZATION: Process items in parallel batches
+                var itemTasks = new List<Task>();
+                var semaphore = new SemaphoreSlim(MaxConcurrentItemsPerFolder);
+
+                for (int i = itemCount; i >= 1; i--)
+                {
+                    if (ct.IsCancellationRequested) break;
+
+                    int itemIndex = i; // Capture for lambda
+                    itemTasks.Add(CopyItemAsync(sourceItems, itemIndex, destFolder, semaphore, sourceFolder.Name, ct, onProgress));
+                }
+
+                // Wait for all items in this folder to be copied
+                await Task.WhenAll(itemTasks);
+            }
+
+            if (sourceItems != null) 
+            {
+                try { Marshal.ReleaseComObject(sourceItems); }
+                catch { }
+            }
+
+            // 2. Recursively process subfolders
+            Outlook.Folders sourceSubFolders = sourceFolder.Folders;
+            foreach (Outlook.Folder sourceSubFolder in sourceSubFolders)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                Outlook.Folder destSubFolder = null;
+                Outlook.Folders destFolders = destFolder.Folders;
+                
+                // Try to find or create subfolder in destination
+                int maxRetries = 2;
+                for (int attempt = 1; attempt <= maxRetries; attempt++)
+                {
+                    Exception delayEx = null;
+                    try
+                    {
+                        destSubFolder = FindFolderByName(destFolders, sourceSubFolder.Name);
+                        
+                        if (destSubFolder == null)
+                        {
+                            try
+                            {
+                                destSubFolder = destFolders.Add(sourceSubFolder.Name, sourceSubFolder.DefaultItemType) as Outlook.Folder;
+                            }
+                            catch (Exception fallbackEx)
+                            {
+                                // Fallback: Try adding without type (needed for Root folders or special stores)
+                                bool isAccessDenied = fallbackEx.Message.Contains("permission") || fallbackEx.Message.Contains("denied");
+                                string accessMsg = string.Format("ACCESS DENIED: Creating folder {0}: {1} [HResult: {2}]", 
+                                    sourceSubFolder.Name, fallbackEx.Message, fallbackEx.HResult);
+                                if (fallbackEx.InnerException != null)
+                                    accessMsg += "\n  Inner: " + fallbackEx.InnerException.Message;
+                                if (isAccessDenied)
+                                    onProgress(-1, accessMsg);
+                                destSubFolder = destFolders.Add(sourceSubFolder.Name) as Outlook.Folder;
+                            }
+                        }
+                        break; // Success, exit retry loop
+                    }
+                    catch (Exception ex)
+                    {
+                        bool isAccessDenied = ex.Message.Contains("permission") || ex.Message.Contains("denied");
+                        if (attempt == maxRetries)
+                        {
+                            string errorMsg = string.Format("Error creating folder {0} after {1} attempts: {2}", 
+                                sourceSubFolder.Name, maxRetries, ex.Message);
+                            if (isAccessDenied)
+                                errorMsg += string.Format(" [HResult: {0}]", ex.HResult);
+                            if (ex.InnerException != null)
+                                errorMsg += "\n  Inner: " + ex.InnerException.Message;
+                            onProgress(-1, errorMsg);
+                        }
+                        else
+                        {
+                            string retryMsg = string.Format("Retry {0}/{1} for folder {2}: {3}", 
+                                attempt, maxRetries, sourceSubFolder.Name, ex.Message);
+                            if (isAccessDenied)
+                                retryMsg += string.Format(" [HResult: {0}]", ex.HResult);
+                            onProgress(-1, retryMsg);
+                            delayEx = ex;
+                        }
+                    }
+                    if (delayEx != null && attempt < maxRetries)
+                        await Task.Delay(50, ct); // Use async delay outside catch
+                }
+
+                if (destSubFolder != null)
+                {
+                    try
+                    {
+                        await CopyFoldersAsync(sourceSubFolder, destSubFolder, ct, onProgress);
+                    }
+                    catch (Exception ex)
+                    {
+                        onProgress(-1, string.Format("Error processing subfolder {0}: {1}", sourceSubFolder.Name, ex.Message));
+                    }
+                    Marshal.ReleaseComObject(destSubFolder);
+                }
+                
+                if (destFolders != null) 
+                {
+                    try { Marshal.ReleaseComObject(destFolders); }
+                    catch { }
+                }
+                if (sourceSubFolder != null) 
+                {
+                    try { Marshal.ReleaseComObject(sourceSubFolder); }
+                    catch { }
+                }
+            }
+            if (sourceSubFolders != null) 
+            {
+                try { Marshal.ReleaseComObject(sourceSubFolders); }
+                catch { }
+            }
+        }
+
+        private async Task CopyItemAsync(Outlook.Items sourceItems, int itemIndex, Outlook.Folder destFolder, SemaphoreSlim semaphore, string folderName, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        {
+            await semaphore.WaitAsync(ct);
+            try
+            {
+                object item = null;
+                dynamic copy = null;
+                try
+                {
+                    item = sourceItems[itemIndex];
+                    
+                    // Attempt to copy item (retry on transient errors only)
+                    int maxRetries = 2;
+                    Exception lastException = null;
+                    
+                    for (int attempt = 1; attempt <= maxRetries; attempt++)
+                    {
+                        Exception delayEx = null;
+                        try
+                        {
+                            // We copy and then move to preserve the source PST in case of failure
+                            dynamic dynItem = item;
+                            copy = dynItem.Copy();
+                            copy.Move(destFolder);
+                            break; // Success
+                        }
+                        catch (Exception ex)
+                        {
+                            lastException = ex;
+                            // Don't retry permission denied errors
+                            bool isAccessDenied = ex.Message.Contains("permission") || ex.Message.Contains("denied") || ex.HResult == -2147024891;
+                            if (isAccessDenied)
+                            {
+                                string accessMsg = string.Format("ACCESS DENIED: Failed to copy item in folder {0}: {1} [HResult: {2}]", 
+                                    folderName, ex.Message, ex.HResult);
+                                if (ex.InnerException != null)
+                                    accessMsg += "\n  Inner: " + ex.InnerException.Message;
+                                onProgress(-1, accessMsg);
+                                throw;
+                            }
+                            
+                            if (attempt == maxRetries)
+                                throw;
+                            
+                            delayEx = ex;
+                        }
+                        if (delayEx != null && attempt < maxRetries)
+                            await Task.Delay(25, ct); // Use async delay outside catch
+                    }
+                }
+                catch (Exception ex)
+                {
+                    string warningMsg = string.Format("Warning: Failed to copy item #{0} in {1}: {2}", 
+                        itemIndex, folderName, ex.Message);
+                    if (ex.InnerException != null)
+                        warningMsg += "\n  Inner: " + ex.InnerException.Message;
+                    onProgress(-1, warningMsg);
+                }
+                finally
+                {
+                    if (copy != null) 
+                    {
+                        try { Marshal.ReleaseComObject(copy); }
+                        catch { }
+                    }
+                    if (item != null) 
+                    {
+                        try { Marshal.ReleaseComObject(item); }
+                        catch { }
+                    }
+                }
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
         private Outlook.Folder FindFolderByName(Outlook.Folders folders, string name)
         {
             foreach (Outlook.Folder f in folders)
@@ -425,7 +651,7 @@ namespace PstMerger
                         }
                     }
                 }
-                catch (Exception _ex)
+                catch
                 {
                      // Intentionally ignored - fallback to Store Root will happen in the legacy loop below
                 }

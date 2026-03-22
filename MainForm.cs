@@ -214,31 +214,17 @@ namespace PstMerger
             {
                 _cts = new System.Threading.CancellationTokenSource();
                 
-                // Run the merge operation on STA thread to avoid COM threading issues
-                var mergeTask = System.Threading.Tasks.Task.Run(() =>
+                // Run the merge operation asynchronously on STA thread to avoid COM threading issues
+                var mergeTask = System.Threading.Tasks.Task.Run(async () =>
                 {
-                    var staThread = new System.Threading.Thread(() =>
+                    await _pstService.MergeFilesAsync(pstFiles, destFile, _cts.Token, (progress, message) =>
                     {
-                        try
+                        this.Invoke(new Action(() =>
                         {
-                            _pstService.MergeFiles(pstFiles, destFile, _cts.Token, (progress, message) => 
-                            {
-                                this.Invoke(new Action(() => 
-                                {
-                                    Log(message);
-                                    if (progress > 0) progressBar.Value = Math.Min(progress, progressBar.Maximum);
-                                }));
-                            });
-                        }
-                        catch (Exception ex)
-                        {
-                            // Re-throw to be caught by outer try-catch
-                            throw new Exception("Merge operation failed: " + ex.Message, ex);
-                        }
+                            Log(message);
+                            if (progress > 0) progressBar.Value = Math.Min(progress, progressBar.Maximum);
+                        }));
                     });
-                    staThread.SetApartmentState(System.Threading.ApartmentState.STA);
-                    staThread.Start();
-                    staThread.Join(); // Wait for completion
                 });
 
                 await mergeTask;
