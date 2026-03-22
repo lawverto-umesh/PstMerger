@@ -2,44 +2,77 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Outlook = Microsoft.Office.Interop.Outlook;
 
 namespace PstMerger
 {
     public class PstService
     {
+        [DllImport("ole32.dll")]
+        private static extern int CoInitializeSecurity(IntPtr pVoid, int cAuthSvc, IntPtr asAuthSvc, IntPtr pReserved1, uint dwAuthnLevel, uint dwImpLevel, IntPtr pAuthList, uint dwCapabilities, IntPtr pReserved3);
+
         public void MergeFiles(string[] sourceFiles, string destinationPst, System.Threading.CancellationToken ct, Action<int, string> onProgress)
         {
+            // Initialize COM security for Outlook interop
+            CoInitializeSecurity(IntPtr.Zero, -1, IntPtr.Zero, IntPtr.Zero, 0, 3, IntPtr.Zero, 0x20, IntPtr.Zero);
+
             Outlook.Application outlookApp = null;
             Outlook.NameSpace ns = null;
             Outlook.Folder destRoot = null;
 
             try
             {
+                // Create Outlook application (assuming we're already on STA thread)
                 outlookApp = new Outlook.Application();
                 ns = outlookApp.GetNamespace("MAPI");
+
+                if (outlookApp == null || ns == null)
+                    throw new Exception("Failed to initialize Outlook application");
 
                 // 1. Ensure the destination PST exists or create it
                 if (!File.Exists(destinationPst))
                 {
                     onProgress(0, "Creating destination PST...");
-                    ns.AddStore(destinationPst);
+                    try
+                    {
+                        ns.AddStore(destinationPst);
+                        Thread.Sleep(200); // Minimal delay to let Outlook register the store
+                    }
+                    catch (Exception ex)
+                    {
+                        string errorMsg = "Failed to create destination PST: " + ex.Message;
+                        if (!string.IsNullOrEmpty(ex.StackTrace))
+                            errorMsg += "\nStackTrace: " + ex.StackTrace;
+                        throw new Exception(errorMsg, ex);
+                    }
                 }
                 else
                 {
                     onProgress(0, "Opening existing destination PST...");
-                    ns.AddStore(destinationPst);
+                    try
+                    {
+                        ns.AddStore(destinationPst);
+                        Thread.Sleep(100); // Minimal delay
+                    }
+                    catch (Exception ex)
+                    {
+                        string errorMsg = "Failed to open destination PST: " + ex.Message;
+                        if (!string.IsNullOrEmpty(ex.StackTrace))
+                            errorMsg += "\nStackTrace: " + ex.StackTrace;
+                        throw new Exception(errorMsg, ex);
+                    }
                 }
 
                 // Get the destination root folder
                 destRoot = GetRootFolder(ns, destinationPst, onProgress);
-                if (destRoot == null) throw new Exception("Could not find destination root.");
+                if (destRoot == null) throw new Exception("Could not find destination root folder for: " + destinationPst);
 
                 int count = 0;
                 foreach (string sourceFile in sourceFiles)
                 {
                     if (ct.IsCancellationRequested) break;
-                    
+
                     // Skip if it's the destination itself
                     if (string.Equals(Path.GetFullPath(sourceFile), Path.GetFullPath(destinationPst), StringComparison.OrdinalIgnoreCase))
                         continue;
@@ -47,15 +80,59 @@ namespace PstMerger
                     count++;
                     onProgress(count, string.Format("Merging: {0}", Path.GetFileName(sourceFile)));
 
-                    ProcessSourcePst(ns, sourceFile, destRoot, ct, onProgress);
+                    try
+                    {
+                        ProcessSourcePst(ns, sourceFile, destRoot, ct, onProgress);
+                    }
+                    catch (Exception ex)
+                    {
+                        string errorMsg = string.Format("Fatal error processing source file {0}: {1}", Path.GetFileName(sourceFile), ex.Message);
+                        if (ex.InnerException != null)
+                            errorMsg += "\nInner error: " + ex.InnerException.Message;
+                        onProgress(-1, errorMsg);
+                        // Don't throw - continue with next file
+                    }
                 }
 
                 ns.RemoveStore(destRoot);
+                onProgress(100, "Merge process completed");
+            }
+            catch (Exception ex)
+            {
+                string fatalMsg = "CRITICAL: " + ex.Message;
+                if (ex.InnerException != null)
+                    fatalMsg += "\nCaused by: " + ex.InnerException.Message;
+                if (!string.IsNullOrEmpty(ex.StackTrace))
+                    fatalMsg += "\nStackTrace: " + ex.StackTrace;
+                onProgress(-1, fatalMsg);
+                throw;
             }
             finally
             {
-                if (ns != null) Marshal.ReleaseComObject(ns);
-                if (outlookApp != null) Marshal.ReleaseComObject(outlookApp);
+                // Properly release COM objects
+                if (destRoot != null) 
+                {
+                    try { Marshal.ReleaseComObject(destRoot); }
+                    catch { }
+                }
+                if (ns != null) 
+                {
+                    try { Marshal.ReleaseComObject(ns); }
+                    catch { }
+                }
+                if (outlookApp != null) 
+                {
+                    try { Marshal.ReleaseComObject(outlookApp); }
+                    catch { }
+                }
+
+                // Force garbage collection to clean up COM references
+                try
+                {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                }
+                catch { }
             }
         }
 
@@ -64,18 +141,57 @@ namespace PstMerger
             Outlook.Folder sourceRoot = null;
             try
             {
-                ns.AddStore(filePath);
+                // Retry logic for adding store
+                int maxRetries = 2;
+                for (int attempt = 1; attempt <= maxRetries; attempt++)
+                {
+                    try
+                    {
+                        ns.AddStore(filePath);
+                        Thread.Sleep(50); // Minimal delay to register store
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        bool isAccessDenied = ex.Message.Contains("access") || ex.HResult == -2147024891;
+                        if (attempt == maxRetries)
+                        {
+                            string errorMsg = string.Format("Failed to add store after {0} attempts: {1}", maxRetries, ex.Message);
+                            if (isAccessDenied)
+                                errorMsg += string.Format(" [File: {0}] [HResult: {1}]", filePath, ex.HResult);
+                            if (ex.InnerException != null)
+                                errorMsg += "\nInner: " + ex.InnerException.Message;
+                            throw new Exception(errorMsg, ex);
+                        }
+                        
+                        string retryMsg = string.Format("Retry {0}/{1} adding store: {2}", attempt, maxRetries, ex.Message);
+                        if (isAccessDenied)
+                            retryMsg += string.Format(" [File: {0}]", filePath);
+                        onProgress(-1, retryMsg);
+                        Thread.Sleep(100); // Minimal wait before retry
+                    }
+                }
+
                 sourceRoot = GetRootFolder(ns, filePath, onProgress);
-                if (sourceRoot == null) return;
+                if (sourceRoot == null)
+                {
+                    throw new Exception("Could not find root folder for source PST: " + filePath);
+                }
 
                 CopyFolders(sourceRoot, destRoot, ct, onProgress);
 
-                ns.RemoveStore(sourceRoot);
+                try { ns.RemoveStore(sourceRoot); }
+                catch { }
                 Marshal.ReleaseComObject(sourceRoot);
             }
             catch (Exception ex)
             {
-                onProgress(-1, string.Format("Error processing {0}: {1}", Path.GetFileName(filePath), ex.Message));
+                string errorMsg = string.Format("Error processing {0}: {1}", Path.GetFileName(filePath), ex.Message);
+                if (ex.InnerException != null)
+                    errorMsg += "\n  Caused by: " + ex.InnerException.Message;
+                if (!string.IsNullOrEmpty(ex.StackTrace))
+                    errorMsg += "\n  Source: " + (ex.Source ?? "unknown");
+                onProgress(-1, errorMsg);
             }
         }
 
@@ -97,23 +213,69 @@ namespace PstMerger
                 {
                     item = sourceItems[i];
                     
-                    // We copy and then move to preserve the source PST in case of failure
-                    // Use dynamic to call Copy/Move on any Outlook item type
-                    dynamic dynItem = item;
-                    copy = dynItem.Copy();
-                    copy.Move(destFolder);
+                    // Attempt to copy item (retry on transient errors only)
+                    int maxRetries = 2;
+                    Exception lastException = null;
+                    
+                    for (int attempt = 1; attempt <= maxRetries; attempt++)
+                    {
+                        try
+                        {
+                            // We copy and then move to preserve the source PST in case of failure
+                            dynamic dynItem = item;
+                            copy = dynItem.Copy();
+                            copy.Move(destFolder);
+                            break; // Success
+                        }
+                        catch (Exception ex)
+                        {
+                            lastException = ex;
+                            // Don't retry permission denied errors
+                            bool isAccessDenied = ex.Message.Contains("permission") || ex.Message.Contains("denied") || ex.HResult == -2147024891;
+                            if (isAccessDenied)
+                            {
+                                string accessMsg = string.Format("ACCESS DENIED: Failed to copy item in folder {0}: {1} [HResult: {2}]", 
+                                    sourceFolder.Name, ex.Message, ex.HResult);
+                                if (ex.InnerException != null)
+                                    accessMsg += "\n  Inner: " + ex.InnerException.Message;
+                                onProgress(-1, accessMsg);
+                                throw;
+                            }
+                            
+                            if (attempt == maxRetries)
+                                throw;
+                                
+                            Thread.Sleep(25); // Minimal wait before retry
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
-                    onProgress(-1, string.Format("Warning: Failed to copy item in {0}: {1}", sourceFolder.Name, ex.Message));
+                    string warningMsg = string.Format("Warning: Failed to copy item #{0} in {1}: {2}", 
+                        i, sourceFolder.Name, ex.Message);
+                    if (ex.InnerException != null)
+                        warningMsg += "\n  Inner: " + ex.InnerException.Message;
+                    onProgress(-1, warningMsg);
                 }
                 finally
                 {
-                    if (copy != null) Marshal.ReleaseComObject(copy);
-                    if (item != null) Marshal.ReleaseComObject(item);
+                    if (copy != null) 
+                    {
+                        try { Marshal.ReleaseComObject(copy); }
+                        catch { }
+                    }
+                    if (item != null) 
+                    {
+                        try { Marshal.ReleaseComObject(item); }
+                        catch { }
+                    }
                 }
             }
-            if (sourceItems != null) Marshal.ReleaseComObject(sourceItems);
+            if (sourceItems != null) 
+            {
+                try { Marshal.ReleaseComObject(sourceItems); }
+                catch { }
+            }
 
             // 2. Recursively process subfolders
             Outlook.Folders sourceSubFolders = sourceFolder.Folders;
@@ -124,8 +286,8 @@ namespace PstMerger
                 Outlook.Folder destSubFolder = null;
                 Outlook.Folders destFolders = destFolder.Folders;
                 
-                // Try to find if subfolder exists in destination, with retry for transient COM errors
-                int maxRetries = 3;
+                // Try to find or create subfolder in destination
+                int maxRetries = 2;
                 for (int attempt = 1; attempt <= maxRetries; attempt++)
                 {
                     try
@@ -138,9 +300,16 @@ namespace PstMerger
                             {
                                 destSubFolder = destFolders.Add(sourceSubFolder.Name, sourceSubFolder.DefaultItemType) as Outlook.Folder;
                             }
-                            catch
+                            catch (Exception fallbackEx)
                             {
-                                // Fallback: Try adding without type (sometimes needed for Root folders or special stores)
+                                // Fallback: Try adding without type (needed for Root folders or special stores)
+                                bool isAccessDenied = fallbackEx.Message.Contains("permission") || fallbackEx.Message.Contains("denied");
+                                string accessMsg = string.Format("ACCESS DENIED: Creating folder {0}: {1} [HResult: {2}]", 
+                                    sourceSubFolder.Name, fallbackEx.Message, fallbackEx.HResult);
+                                if (fallbackEx.InnerException != null)
+                                    accessMsg += "\n  Inner: " + fallbackEx.InnerException.Message;
+                                if (isAccessDenied)
+                                    onProgress(-1, accessMsg);
                                 destSubFolder = destFolders.Add(sourceSubFolder.Name) as Outlook.Folder;
                             }
                         }
@@ -148,28 +317,58 @@ namespace PstMerger
                     }
                     catch (Exception ex)
                     {
+                        bool isAccessDenied = ex.Message.Contains("permission") || ex.Message.Contains("denied");
                         if (attempt == maxRetries)
                         {
-                            onProgress(-1, string.Format("Error creating folder {0} after {1} attempts: {2}", sourceSubFolder.Name, maxRetries, ex.Message));
+                            string errorMsg = string.Format("Error creating folder {0} after {1} attempts: {2}", 
+                                sourceSubFolder.Name, maxRetries, ex.Message);
+                            if (isAccessDenied)
+                                errorMsg += string.Format(" [HResult: {0}]", ex.HResult);
+                            if (ex.InnerException != null)
+                                errorMsg += "\n  Inner: " + ex.InnerException.Message;
+                            onProgress(-1, errorMsg);
                         }
                         else
                         {
-                            onProgress(-1, string.Format("Retry {0}/{1} for folder {2}: {3}", attempt, maxRetries, sourceSubFolder.Name, ex.Message));
-                            System.Threading.Thread.Sleep(500);
+                            string retryMsg = string.Format("Retry {0}/{1} for folder {2}: {3}", 
+                                attempt, maxRetries, sourceSubFolder.Name, ex.Message);
+                            if (isAccessDenied)
+                                retryMsg += string.Format(" [HResult: {0}]", ex.HResult);
+                            onProgress(-1, retryMsg);
+                            Thread.Sleep(50); // Minimal wait before retry
                         }
                     }
                 }
 
                 if (destSubFolder != null)
                 {
-                    CopyFolders(sourceSubFolder, destSubFolder, ct, onProgress);
+                    try
+                    {
+                        CopyFolders(sourceSubFolder, destSubFolder, ct, onProgress);
+                    }
+                    catch (Exception ex)
+                    {
+                        onProgress(-1, string.Format("Error processing subfolder {0}: {1}", sourceSubFolder.Name, ex.Message));
+                    }
                     Marshal.ReleaseComObject(destSubFolder);
                 }
                 
-                if (destFolders != null) Marshal.ReleaseComObject(destFolders);
-                if (sourceSubFolder != null) Marshal.ReleaseComObject(sourceSubFolder);
+                if (destFolders != null) 
+                {
+                    try { Marshal.ReleaseComObject(destFolders); }
+                    catch { }
+                }
+                if (sourceSubFolder != null) 
+                {
+                    try { Marshal.ReleaseComObject(sourceSubFolder); }
+                    catch { }
+                }
             }
-            if (sourceSubFolders != null) Marshal.ReleaseComObject(sourceSubFolders);
+            if (sourceSubFolders != null) 
+            {
+                try { Marshal.ReleaseComObject(sourceSubFolders); }
+                catch { }
+            }
         }
 
         private Outlook.Folder FindFolderByName(Outlook.Folders folders, string name)
@@ -226,10 +425,9 @@ namespace PstMerger
                         }
                     }
                 }
-                catch (Exception ex)
+                catch (Exception _ex)
                 {
-                     // Log warning only if verbose logging is enabled or critical
-                     // onProgress(0, string.Format("Warning: Failed to resolve IPM Subtree: {0}. Implementation will fallback to Store Root.", ex.Message));
+                     // Intentionally ignored - fallback to Store Root will happen in the legacy loop below
                 }
 
                 // Fallback to Store Root will happen in the legacy loop below

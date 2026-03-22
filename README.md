@@ -60,7 +60,7 @@ git clone https://github.com/YourUsername/PstMergeTool.git
 cd PstMergeTool
 
 # Build with MSBuild
-msbuild PstMerger.csproj /p:Configuration=Release
+msbuild PstMerger.csproj /tv:4.0 /p:TargetFrameworkVersion=v4.0 /p:Configuration=Release
 ```
 
 The compiled executable will be in `bin\Release\PstMerger.exe`.

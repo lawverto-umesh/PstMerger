@@ -14,11 +14,90 @@ namespace PstMerger
 
         public MainForm()
         {
-            InitializeComponent();
-            this.Text = string.Format("PST Merge Tool v{0}", Application.ProductVersion);
-            _pstService = new PstService();
-            _logFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, string.Format("PstMerge_{0:yyyyMMdd_HHmmss}.log", DateTime.Now));
-            Log("Tool initialized. Enterprise Log started: " + _logFile);
+            try
+            {
+                InitializeComponent();
+                this.Text = string.Format("PST Merge Tool v{0}", Application.ProductVersion);
+                _pstService = new PstService();
+                _logFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, string.Format("PstMerge_{0:yyyyMMdd_HHmmss}.log", DateTime.Now));
+                Log("Tool initialized. Enterprise Log started: " + _logFile);
+                
+                // Set form closing handler to catch exceptions during shutdown
+                this.FormClosing += MainForm_FormClosing;
+                this.FormClosed += MainForm_FormClosed;
+                
+                // Kill Outlook process to prevent COM conflicts during merge
+                KillOutlookProcess();
+            }
+            catch (Exception ex)
+            {
+                string msg = string.Format("CRITICAL ERROR during initialization: {0}\nStackTrace: {1}", ex.Message, ex.StackTrace);
+                try { if (_logFile != null) File.AppendAllText(_logFile, msg + Environment.NewLine); } catch { }
+                throw;
+            }
+        }
+
+        private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            try
+            {
+                if (_cts != null)
+                {
+                    _cts.Cancel();
+                    _cts.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR during form closing: " + ex.Message);
+            }
+        }
+
+        private void MainForm_FormClosed(object sender, FormClosedEventArgs e)
+        {
+            try
+            {
+                if (_pstService != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(_pstService);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR during form closed cleanup: " + ex.Message);
+            }
+        }
+
+        private void KillOutlookProcess()
+        {
+            try
+            {
+                System.Diagnostics.Process[] processes = System.Diagnostics.Process.GetProcessesByName("OUTLOOK");
+                if (processes.Length > 0)
+                {
+                    Log(string.Format("Found {0} Outlook process(es). Terminating...", processes.Length));
+                    
+                    foreach (var process in processes)
+                    {
+                        try
+                        {
+                            process.Kill();
+                            process.WaitForExit(5000); // Wait up to 5 seconds for graceful termination
+                            Log("Outlook process terminated successfully.");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log("Warning: Failed to terminate Outlook: " + ex.Message);
+                        }
+                    }
+                    
+                    System.Threading.Thread.Sleep(1000); // Give Outlook time to fully close
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("Warning: Error checking for Outlook process: " + ex.Message);
+            }
         }
 
         private void btnBrowseSource_Click(object sender, EventArgs e)
@@ -119,6 +198,9 @@ namespace PstMerger
                 return;
             }
 
+            // Check for running Outlook before starting
+            ShowOutlookWarning();
+
             btnStartMerge.Enabled = false;
             btnFixRegistry.Enabled = false;
             btnCancel.Visible = true;
@@ -131,17 +213,35 @@ namespace PstMerger
             try
             {
                 _cts = new System.Threading.CancellationTokenSource();
-                await Task.Run(() => 
+                
+                // Run the merge operation on STA thread to avoid COM threading issues
+                var mergeTask = System.Threading.Tasks.Task.Run(() =>
                 {
-                    _pstService.MergeFiles(pstFiles, destFile, _cts.Token, (progress, message) => 
+                    var staThread = new System.Threading.Thread(() =>
                     {
-                        this.Invoke(new Action(() => 
+                        try
                         {
-                            Log(message);
-                            if (progress > 0) progressBar.Value = Math.Min(progress, progressBar.Maximum);
-                        }));
+                            _pstService.MergeFiles(pstFiles, destFile, _cts.Token, (progress, message) => 
+                            {
+                                this.Invoke(new Action(() => 
+                                {
+                                    Log(message);
+                                    if (progress > 0) progressBar.Value = Math.Min(progress, progressBar.Maximum);
+                                }));
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            // Re-throw to be caught by outer try-catch
+                            throw new Exception("Merge operation failed: " + ex.Message, ex);
+                        }
                     });
+                    staThread.SetApartmentState(System.Threading.ApartmentState.STA);
+                    staThread.Start();
+                    staThread.Join(); // Wait for completion
                 });
+
+                await mergeTask;
 
                 if (_cts.Token.IsCancellationRequested)
                 {
@@ -161,6 +261,22 @@ namespace PstMerger
             catch (Exception ex)
             {
                 Log("FATAL ERROR: " + ex.Message);
+                Log("ERROR DETAILS: " + ex.GetType().Name);
+                if (!string.IsNullOrEmpty(ex.StackTrace))
+                    Log("STACK TRACE: " + ex.StackTrace);
+                
+                // Log inner exceptions recursively
+                Exception inner = ex.InnerException;
+                int depth = 1;
+                while (inner != null && depth <= 5)
+                {
+                    Log(string.Format("INNER EXCEPTION {0}: {1}", depth, inner.Message));
+                    if (!string.IsNullOrEmpty(inner.StackTrace))
+                        Log(string.Format("INNER STACK {0}: {1}", depth, inner.StackTrace));
+                    inner = inner.InnerException;
+                    depth++;
+                }
+                
                 MessageBox.Show("An error occurred during the merge:\n\n" + ex.Message, "Merge Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
@@ -182,18 +298,64 @@ namespace PstMerger
             }
         }
 
+        private bool IsOutlookRunning()
+        {
+            try
+            {
+                System.Diagnostics.Process[] processes = System.Diagnostics.Process.GetProcessesByName("OUTLOOK");
+                return processes.Length > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void ShowOutlookWarning()
+        {
+            if (IsOutlookRunning())
+            {
+                var result = MessageBox.Show(
+                    "Outlook appears to be running. This can cause COM errors during PST merging.\n\n" +
+                    "For best results, please close Outlook before merging PST files.\n\n" +
+                    "Continue anyway?",
+                    "Outlook Running Warning",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning
+                );
+                
+                if (result == DialogResult.No)
+                {
+                    return; // User cancelled
+                }
+            }
+        }
+
         private void Log(string message)
         {
-            if (txtLog.InvokeRequired)
+            try
             {
-                txtLog.Invoke(new Action(() => Log(message)));
-                return;
+                if (txtLog.InvokeRequired)
+                {
+                    txtLog.Invoke(new Action(() => Log(message)));
+                    return;
+                }
+                string line = string.Format("[{0:HH:mm:ss}] {1}", DateTime.Now, message);
+                txtLog.AppendText(line + Environment.NewLine);
+                
+                // Persistent File Logging
+                try { File.AppendAllText(_logFile, line + Environment.NewLine); } catch { }
             }
-            string line = string.Format("[{0:HH:mm:ss}] {1}", DateTime.Now, message);
-            txtLog.AppendText(line + Environment.NewLine);
-            
-            // Persistent File Logging
-            try { File.AppendAllText(_logFile, line + Environment.NewLine); } catch { }
+            catch (Exception ex)
+            {
+                // If UI logging fails, still try file logging
+                try
+                {
+                    string line = string.Format("[{0:HH:mm:ss}] LOG ERROR: {1} - Message was: {2}", DateTime.Now, ex.Message, message);
+                    File.AppendAllText(_logFile, line + Environment.NewLine);
+                }
+                catch { }
+            }
         }
 
         private void btnAbout_Click(object sender, EventArgs e)
