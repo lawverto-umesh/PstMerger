@@ -20,6 +20,7 @@ It was built specifically to handle **large mailboxes (up to 2TB)** and includes
 - ✅ **2TB size limit support** (removes the default 50GB Outlook restriction)
 - ✅ **Preserves folder structure** (Inbox, Sent Items, subfolders, etc.)
 - ✅ **Handles all item types** (Emails, Contacts, Calendar, Tasks, Notes)
+- ✅ **Duplicate detection** (optional - can be disabled for faster processing)
 - ✅ **Graceful cancellation** - stop safely without corrupting data
 - ✅ **Persistent logging** - every action saved to a log file
 - ✅ **Disk space validation** - warns before running out of space
@@ -39,6 +40,14 @@ It was built specifically to handle **large mailboxes (up to 2TB)** and includes
 4. **Select source folder** containing your PST files
 5. **Select destination** for the merged PST
 6. **Click "Start Merge"** and wait for completion
+
+### Command Line Options
+
+The tool supports the following command line parameter:
+
+- `--skip-duplicates` or `-s`: Skip duplicate checking during merge (faster processing, may include duplicates)
+  - Example: `PstMerger.exe --skip-duplicates`
+  - When enabled, the window title will show "(Duplicate checking: DISABLED)"
 
 > ⚠️ **Important**: Close Outlook before running the merge. Do not use the computer for heavy tasks during the merge process.
 

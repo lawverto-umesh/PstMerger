@@ -12,15 +12,19 @@ namespace PstMerger
         private System.Threading.CancellationTokenSource _cts;
         private string _logFile;
 
-        public MainForm()
+        public MainForm(bool skipDuplicateChecking = false)
         {
+            _skipDuplicateChecking = skipDuplicateChecking;
+            
             try
             {
                 InitializeComponent();
-                this.Text = string.Format("PST Merge Tool v{0}", Application.ProductVersion);
+                string duplicateCheckStatus = _skipDuplicateChecking ? "DISABLED" : "ENABLED";
+                this.Text = string.Format("PST Merge Tool v{0} (Duplicate checking: {1})", Application.ProductVersion, duplicateCheckStatus);
                 _pstService = new PstService();
                 _logFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, string.Format("PstMerge_{0:yyyyMMdd_HHmmss}.log", DateTime.Now));
                 Log("Tool initialized. Enterprise Log started: " + _logFile);
+                Log("Duplicate checking: " + duplicateCheckStatus);
                 
                 // Set form closing handler to catch exceptions during shutdown
                 this.FormClosing += MainForm_FormClosing;
@@ -227,11 +231,18 @@ namespace PstMerger
                             SetCurrentCopyStatus(message);
                             return;
                         }
+                        if (progress == -3)
+                        {
+                            // Log skipped items to both main log and current copy status
+                            Log(message);
+                            SetCurrentCopyStatus(message);
+                            return;
+                        }
 
                         Log(message);
                         if (progress > 0) progressBar.Value = Math.Min(progress, progressBar.Maximum);
                     }));
-                });
+                }, _skipDuplicateChecking);
                 });
 
                 await mergeTask;

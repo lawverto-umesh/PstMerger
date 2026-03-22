@@ -7,10 +7,31 @@ namespace PstMerger
     static class Program
     {
         private static string _crashLogFile;
+        public static bool SkipDuplicateChecking { get; private set; }
+
+        private static void ParseCommandLineArgs(string[] args)
+        {
+            SkipDuplicateChecking = false;
+            
+            foreach (string arg in args)
+            {
+                string lowerArg = arg.ToLowerInvariant();
+                if (lowerArg == "--skip-duplicates" || lowerArg == "-s" || lowerArg == "/skip-duplicates")
+                {
+                    SkipDuplicateChecking = true;
+                    break;
+                }
+            }
+        }
 
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
+            // Parse command line arguments
+            ParseCommandLineArgs(args);
+
+            // Set up crash logging before anything else
+            _crashLogFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, string.Format("PstMerge_CRASH_{0:yyyyMMdd_HHmmss}.log", DateTime.Now));
             // Set up crash logging before anything else
             _crashLogFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, string.Format("PstMerge_CRASH_{0:yyyyMMdd_HHmmss}.log", DateTime.Now));
             
@@ -23,7 +44,7 @@ namespace PstMerger
             {
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new MainForm());
+                Application.Run(new MainForm(SkipDuplicateChecking));
             }
             catch (Exception ex)
             {

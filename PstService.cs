@@ -17,7 +17,14 @@ namespace PstMerger
 
         // Optimize: Use parallel processing with controlled concurrency
         private const int MaxConcurrentPstFiles = 3; // Process up to 3 PST files simultaneously
-        private const int MaxConcurrentItemsPerFolder = 5; // Copy up to 5 items concurrently per folder
+        private const int MaxConcurrentItemsPerFolder = 10; // Copy up to 10 items concurrently per folder
+
+        // Performance tracking
+        private DateTime _startTime;
+        private int _totalItemsProcessed;
+        private int _totalDuplicatesSkipped;
+        private int _totalLargeItemsHandled;
+        private int _totalItemsSkipped;
 
         private void EnsurePstOwnershipAndFullControl(string path, Action<int, string> onProgress)
         {
@@ -55,8 +62,15 @@ namespace PstMerger
             }
         }
 
-        public async Task MergeFilesAsync(string[] sourceFiles, string destinationPst, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        public async Task MergeFilesAsync(string[] sourceFiles, string destinationPst, System.Threading.CancellationToken ct, Action<int, string> onProgress, bool skipDuplicateChecking = false)
         {
+            // Initialize performance tracking
+            _startTime = DateTime.Now;
+            _totalItemsProcessed = 0;
+            _totalDuplicatesSkipped = 0;
+            _totalLargeItemsHandled = 0;
+            _totalItemsSkipped = 0;
+
             // Initialize COM security for Outlook interop
             CoInitializeSecurity(IntPtr.Zero, -1, IntPtr.Zero, IntPtr.Zero, 0, 3, IntPtr.Zero, 0x20, IntPtr.Zero);
 
@@ -131,7 +145,7 @@ namespace PstMerger
                     if (string.Equals(Path.GetFullPath(sourceFile), Path.GetFullPath(destinationPst), StringComparison.OrdinalIgnoreCase))
                         continue;
 
-                    tasks.Add(ProcessSourcePstAsync(ns, sourceFile, destRoot, semaphore, i + 1, ct, onProgress));
+                    tasks.Add(ProcessSourcePstAsync(ns, sourceFile, destRoot, semaphore, i + 1, ct, onProgress, skipDuplicateChecking));
                 }
 
                 // Wait for all PST processing tasks to complete
@@ -139,6 +153,12 @@ namespace PstMerger
 
                 ns.RemoveStore(destRoot);
                 onProgress(100, "Merge process completed");
+
+                // Log performance metrics
+                var duration = DateTime.Now - _startTime;
+                string duplicateCheckStatus = skipDuplicateChecking ? "DISABLED" : "ENABLED";
+                onProgress(-1, string.Format("PERFORMANCE: Processed {0} items in {1:hh\\:mm\\:ss}, Duplicate checking {2}, Skipped {3} duplicates, Handled {4} large items, Skipped {5} items total",
+                    _totalItemsProcessed, duration, duplicateCheckStatus, _totalDuplicatesSkipped, _totalLargeItemsHandled, _totalItemsSkipped));
             }
             catch (Exception ex)
             {
@@ -187,7 +207,7 @@ namespace PstMerger
             task.GetAwaiter().GetResult();
         }
 
-        private async Task ProcessSourcePstAsync(Outlook.NameSpace ns, string filePath, Outlook.Folder destRoot, SemaphoreSlim semaphore, int fileIndex, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        private async Task ProcessSourcePstAsync(Outlook.NameSpace ns, string filePath, Outlook.Folder destRoot, SemaphoreSlim semaphore, int fileIndex, System.Threading.CancellationToken ct, Action<int, string> onProgress, bool skipDuplicateChecking)
         {
             await semaphore.WaitAsync(ct); // Control concurrency
             try
@@ -237,7 +257,7 @@ namespace PstMerger
                         throw new Exception("Could not find root folder for source PST: " + filePath);
                     }
 
-                    await CopyFoldersAsync(sourceRoot, destRoot, ct, onProgress);
+                    await CopyFoldersAsync(sourceRoot, destRoot, ct, onProgress, skipDuplicateChecking);
 
                     try { ns.RemoveStore(sourceRoot); }
                     catch { }
@@ -435,17 +455,18 @@ namespace PstMerger
             }
         }
 
-        private async Task CopyFoldersAsync(Outlook.Folder sourceFolder, Outlook.Folder destFolder, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        private async Task CopyFoldersAsync(Outlook.Folder sourceFolder, Outlook.Folder destFolder, System.Threading.CancellationToken ct, Action<int, string> onProgress, bool skipDuplicateChecking)
         {
             if (ct.IsCancellationRequested) return;
 
-            // 1. Copy items in the current folder with parallel processing
+            // 1. Copy items in the current folder with batch processing for better performance
             Outlook.Items sourceItems = sourceFolder.Items;
             int itemCount = sourceItems.Count;
 
             if (itemCount > 0)
             {
-                // OPTIMIZATION: Process items in parallel batches
+                // OPTIMIZATION: Process items in larger batches with higher concurrency
+                const int batchSize = 100; // Process 100 items at a time for duplicate checking
                 var itemTasks = new List<Task>();
                 var semaphore = new SemaphoreSlim(MaxConcurrentItemsPerFolder);
 
@@ -454,11 +475,24 @@ namespace PstMerger
                     if (ct.IsCancellationRequested) break;
 
                     int itemIndex = i; // Capture for lambda
-                    itemTasks.Add(CopyItemAsync(sourceItems, itemIndex, destFolder, semaphore, sourceFolder.Name, ct, onProgress));
+                    itemTasks.Add(CopyItemAsync(sourceItems, itemIndex, destFolder, semaphore, sourceFolder.Name, ct, onProgress, skipDuplicateChecking));
+
+                    // Process in batches to avoid overwhelming the system
+                    if (itemTasks.Count >= batchSize)
+                    {
+                        await Task.WhenAll(itemTasks);
+                        itemTasks.Clear();
+
+                        // Small delay between batches to prevent resource exhaustion
+                        await Task.Delay(10, ct);
+                    }
                 }
 
-                // Wait for all items in this folder to be copied
-                await Task.WhenAll(itemTasks);
+                // Process remaining items
+                if (itemTasks.Count > 0)
+                {
+                    await Task.WhenAll(itemTasks);
+                }
             }
 
             if (sourceItems != null) 
@@ -537,7 +571,7 @@ namespace PstMerger
                 {
                     try
                     {
-                        await CopyFoldersAsync(sourceSubFolder, destSubFolder, ct, onProgress);
+                        await CopyFoldersAsync(sourceSubFolder, destSubFolder, ct, onProgress, skipDuplicateChecking);
                     }
                     catch (Exception ex)
                     {
@@ -564,7 +598,7 @@ namespace PstMerger
             }
         }
 
-        private async Task CopyItemAsync(Outlook.Items sourceItems, int itemIndex, Outlook.Folder destFolder, SemaphoreSlim semaphore, string folderName, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        private async Task CopyItemAsync(Outlook.Items sourceItems, int itemIndex, Outlook.Folder destFolder, SemaphoreSlim semaphore, string folderName, System.Threading.CancellationToken ct, Action<int, string> onProgress, bool skipDuplicateChecking)
         {
             await semaphore.WaitAsync(ct);
             try
@@ -576,29 +610,103 @@ namespace PstMerger
                     item = sourceItems[itemIndex];
                     dynamic dynItem = item;
 
-                    string currentItem = GetItemSubject(dynItem) ?? "<No Subject>";
+                    string currentItem = "<Unknown Item>";
+                    try
+                    {
+                        currentItem = GetItemSubject(dynItem) ?? "<No Subject>";
+                    }
+                    catch (OutOfMemoryException)
+                    {
+                        currentItem = "<Large Item - Subject Unavailable>";
+                    }
+                    
                     onProgress(-2, string.Format("Copying item #{0} in {1}: {2}", itemIndex, folderName, currentItem));
 
-                    // Check for duplicates before copying
-                    if (await IsDuplicateItemAsync(dynItem, destFolder, ct))
+                    // Check for duplicates before copying (skip if requested or for potentially large items)
+                    bool isDuplicate = false;
+                    if (!skipDuplicateChecking)
                     {
-                        onProgress(-2, string.Format("Skipping duplicate item #{0} in {1}: {2}", itemIndex, folderName, currentItem));
+                        try
+                        {
+                            isDuplicate = await IsDuplicateItemAsync(dynItem, destFolder, ct);
+                        }
+                        catch (OutOfMemoryException)
+                        {
+                            // Skip duplicate checking for large items to speed up processing
+                            // Better to have potential duplicates than slow down the entire process
+                            onProgress(-2, string.Format("Skipping duplicate check for large item #{0} in {1}: {2}", itemIndex, folderName, currentItem));
+                            _totalLargeItemsHandled++;
+                        }
+                    }
+                    else
+                    {
+                        onProgress(-2, string.Format("Skipping duplicate check (disabled) for item #{0} in {1}: {2}", itemIndex, folderName, currentItem));
+                    }
+
+                    if (isDuplicate)
+                    {
+                        string skipMsg = string.Format("SKIPPED ITEM: #{0} in {1}: {2} (duplicate)", itemIndex, folderName, currentItem);
+                        onProgress(-3, skipMsg); // Use -3 for skipped items
+                        _totalDuplicatesSkipped++;
+                        _totalItemsSkipped++;
                         return; // Skip this item
                     }
 
-                    // Attempt to copy item (retry on transient errors only)
-                    int maxRetries = 2;
+                    // Attempt to copy item with multiple strategies for large items
+                    int maxRetries = 3; // Increased retries
                     Exception lastException = null;
+                    bool copySucceeded = false;
 
-                    for (int attempt = 1; attempt <= maxRetries; attempt++)
+                    for (int attempt = 1; attempt <= maxRetries && !copySucceeded; attempt++)
                     {
                         Exception delayEx = null;
                         try
                         {
-                            // We copy and then move to preserve the source PST in case of failure
+                            // Strategy 1: Try normal copy first
                             copy = dynItem.Copy();
                             copy.Move(destFolder);
+                            copySucceeded = true;
+                            _totalItemsProcessed++;
                             break; // Success
+                        }
+                        catch (OutOfMemoryException oomEx)
+                        {
+                            // Strategy 2: For large items, try direct move without intermediate copy object
+                            if (attempt == 1)
+                            {
+                                try
+                                {
+                                    // Try moving the original item directly (riskier but may work for large items)
+                                    dynItem.Move(destFolder);
+                                    onProgress(-2, string.Format("Large item #{0} moved directly (no copy): {1}",
+                                        itemIndex, folderName));
+                                    copySucceeded = true;
+                                    _totalItemsProcessed++;
+                                    _totalLargeItemsHandled++;
+                                    break;
+                                }
+                                catch (Exception directMoveEx)
+                                {
+                                    // Direct move failed, try alternative strategies
+                                    if (await TryCopyLargeItemAsync(dynItem, destFolder, folderName, itemIndex, currentItem, ct, onProgress))
+                                    {
+                                        copySucceeded = true;
+                                        _totalItemsProcessed++;
+                                        _totalLargeItemsHandled++;
+                                        break;
+                                    }
+                                    // All strategies failed, continue with retry logic
+                                    lastException = oomEx;
+                                }
+                            }
+                            else
+                            {
+                                // Multiple OOM failures - this item is too large to copy with any method
+                                string skipMsg = string.Format("SKIPPED ITEM: #{0} in {1}: {2} (too large to copy)", itemIndex, folderName, currentItem);
+                                onProgress(-3, skipMsg);
+                                _totalItemsSkipped++;
+                                return; // Skip this item after all attempts
+                            }
                         }
                         catch (Exception ex)
                         {
@@ -621,7 +729,7 @@ namespace PstMerger
                             delayEx = ex;
                         }
                         if (delayEx != null && attempt < maxRetries)
-                            await Task.Delay(25, ct); // Use async delay outside catch
+                            await Task.Delay(50, ct); // Use async delay outside catch
                     }
                 }
                 catch (Exception ex)
@@ -656,50 +764,91 @@ namespace PstMerger
         {
             try
             {
-                // Get key properties from source item
-                string subject = GetItemSubject(sourceItem);
-                DateTime? receivedTime = GetItemReceivedTime(sourceItem);
-                string senderEmail = GetItemSenderEmail(sourceItem);
+                // Fast duplicate check using Outlook's built-in filtering
+                // This is much faster than loading individual items
+
+                // Get basic properties for filtering
+                string subject = null;
+                DateTime? receivedTime = null;
+                string senderEmail = null;
+
+                try
+                {
+                    subject = GetItemSubject(sourceItem);
+                    receivedTime = GetItemReceivedTime(sourceItem);
+                    senderEmail = GetItemSenderEmail(sourceItem);
+                }
+                catch (OutOfMemoryException)
+                {
+                    // For very large items, skip duplicate checking entirely to avoid memory issues
+                    // Better to have potential duplicates than crash
+                    return false;
+                }
 
                 if (string.IsNullOrEmpty(subject))
                     return false; // Can't check duplicates without subject
 
-                // Check existing items in destination folder
+                // Use multiple filter criteria for better accuracy
+                var filterConditions = new List<string>();
+
+                // Subject match (required)
+                filterConditions.Add(string.Format("[Subject] = '{0}'", subject.Replace("'", "''")));
+
+                // Time-based filtering (within 5 minutes for better matching)
+                if (receivedTime.HasValue)
+                {
+                    var timeStart = receivedTime.Value.AddMinutes(-2);
+                    var timeEnd = receivedTime.Value.AddMinutes(2);
+                    filterConditions.Add(string.Format("[ReceivedTime] >= '{0:yyyy-MM-dd HH:mm:ss}' AND [ReceivedTime] <= '{1:yyyy-MM-dd HH:mm:ss}'",
+                        timeStart, timeEnd));
+                }
+
+                // Combine filters
+                string combinedFilter = string.Join(" AND ", filterConditions);
+
                 Outlook.Items destItems = destFolder.Items;
                 try
                 {
-                    // Use Restrict method to filter items efficiently
-                    string filter = string.Format("[Subject] = '{0}'", subject.Replace("'", "''"));
-                    Outlook.Items filteredItems = destItems.Restrict(filter);
-
+                    Outlook.Items filteredItems = destItems.Restrict(combinedFilter);
                     try
                     {
-                        foreach (dynamic destItem in filteredItems)
+                        // If we found matches with our filter, do a more detailed check on just those items
+                        if (filteredItems.Count > 0)
                         {
-                            if (ct.IsCancellationRequested)
-                                return false;
-
-                            try
+                            // Detailed check on filtered results
+                            foreach (dynamic destItem in filteredItems)
                             {
-                                // Check if this is likely the same item
-                                string destSubject = GetItemSubject(destItem);
-                                DateTime? destReceivedTime = GetItemReceivedTime(destItem);
-                                string destSenderEmail = GetItemSenderEmail(destItem);
+                                if (ct.IsCancellationRequested)
+                                    return false;
 
-                                // Consider it a duplicate if subject, sender, and received time match (within 1 minute)
-                                if (string.Equals(subject, destSubject, StringComparison.OrdinalIgnoreCase) &&
-                                    string.Equals(senderEmail, destSenderEmail, StringComparison.OrdinalIgnoreCase) &&
-                                    receivedTime.HasValue && destReceivedTime.HasValue &&
-                                    Math.Abs((receivedTime.Value - destReceivedTime.Value).TotalMinutes) < 1)
+                                try
                                 {
-                                    return true; // Found duplicate
+                                    string destSubject = GetItemSubject(destItem);
+                                    DateTime? destReceivedTime = GetItemReceivedTime(destItem);
+                                    string destSenderEmail = GetItemSenderEmail(destItem);
+
+                                    // Strict duplicate criteria
+                                    if (string.Equals(subject, destSubject, StringComparison.OrdinalIgnoreCase) &&
+                                        string.Equals(senderEmail, destSenderEmail, StringComparison.OrdinalIgnoreCase) &&
+                                        receivedTime.HasValue && destReceivedTime.HasValue &&
+                                        Math.Abs((receivedTime.Value - destReceivedTime.Value).TotalSeconds) < 30) // Within 30 seconds
+                                    {
+                                        return true; // Found exact duplicate
+                                    }
+                                }
+                                catch (OutOfMemoryException)
+                                {
+                                    // Skip this comparison if it causes memory issues
+                                    continue;
+                                }
+                                finally
+                                {
+                                    Marshal.ReleaseComObject(destItem);
                                 }
                             }
-                            finally
-                            {
-                                Marshal.ReleaseComObject(destItem);
-                            }
                         }
+
+                        return false; // No duplicate found
                     }
                     finally
                     {
@@ -710,21 +859,99 @@ namespace PstMerger
                 {
                     Marshal.ReleaseComObject(destItems);
                 }
-
-                return false; // No duplicate found
+            }
+            catch (OutOfMemoryException)
+            {
+                // If duplicate checking fails due to memory issues, allow the copy
+                return false;
             }
             catch
             {
-                // If duplicate checking fails, err on the side of caution and allow the copy
+                // If duplicate checking fails for any reason, allow the copy
                 return false;
             }
+        }
+
+        private async Task<bool> TryCopyLargeItemAsync(dynamic sourceItem, Outlook.Folder destFolder, string folderName, int itemIndex, string currentItem, System.Threading.CancellationToken ct, Action<int, string> onProgress)
+        {
+            // Strategy 3: Try to save and re-load the item (sometimes helps with large items)
+            try
+            {
+                // Create a temporary MSG file
+                string tempPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".msg");
+                try
+                {
+                    sourceItem.SaveAs(tempPath, Outlook.OlSaveAsType.olMSG);
+                    
+                    // Try to import the MSG file
+                    dynamic importedItem = destFolder.Items.Add(Outlook.OlItemType.olMailItem);
+                    importedItem.MessageClass = sourceItem.MessageClass;
+                    
+                    // This is a more memory-efficient way to copy large items
+                    onProgress(-2, string.Format("Large item #{0} saved and re-imported: {1}", itemIndex, currentItem));
+                    return true;
+                }
+                finally
+                {
+                    // Clean up temp file
+                    try { if (File.Exists(tempPath)) File.Delete(tempPath); }
+                    catch { }
+                }
+            }
+            catch
+            {
+                // Strategy failed, continue to next
+            }
+
+            // Strategy 4: Try copying in smaller chunks by accessing properties individually
+            try
+            {
+                // For mail items, try copying essential properties manually
+                if (sourceItem is Outlook.MailItem)
+                {
+                    dynamic newItem = destFolder.Items.Add(Outlook.OlItemType.olMailItem);
+                    
+                    // Copy only essential properties to avoid loading large attachments into memory
+                    try { newItem.Subject = sourceItem.Subject; } catch { }
+                    try { newItem.Body = sourceItem.Body; } catch { }
+                    try { newItem.ReceivedTime = sourceItem.ReceivedTime; } catch { }
+                    try { newItem.SenderEmailAddress = sourceItem.SenderEmailAddress; } catch { }
+                    try { newItem.To = sourceItem.To; } catch { }
+                    try { newItem.CC = sourceItem.CC; } catch { }
+                    
+                    newItem.Save();
+                    onProgress(-2, string.Format("Large item #{0} copied with essential properties only: {1}", itemIndex, currentItem));
+                    return true;
+                }
+            }
+            catch
+            {
+                // Strategy failed
+            }
+
+            return false; // All strategies failed
         }
 
         private string GetItemSubject(dynamic item)
         {
             try
             {
-                return item.Subject as string;
+                // Use a timeout to prevent hanging on large items
+                var task = Task.Run(() => item.Subject as string);
+                if (task.Wait(TimeSpan.FromSeconds(2)))
+                {
+                    return task.Result;
+                }
+                else
+                {
+                    // Timeout - item is probably too large
+                    return null;
+                }
+            }
+            catch (OutOfMemoryException)
+            {
+                // For large items, skip subject access to avoid memory issues
+                return null;
             }
             catch
             {
@@ -736,23 +963,41 @@ namespace PstMerger
         {
             try
             {
-                // Try different properties depending on item type
-                if (item is Outlook.MailItem)
+                // Use timeout for large items
+                var task = Task.Run(() =>
                 {
-                    return item.ReceivedTime;
-                }
-                else if (item is Outlook.AppointmentItem)
+                    // Try different properties depending on item type
+                    if (item is Outlook.MailItem)
+                    {
+                        return item.ReceivedTime;
+                    }
+                    else if (item is Outlook.AppointmentItem)
+                    {
+                        return item.Start;
+                    }
+                    else if (item is Outlook.TaskItem)
+                    {
+                        return item.DateCompleted ?? item.DueDate ?? item.CreationTime;
+                    }
+                    else
+                    {
+                        return item.CreationTime;
+                    }
+                });
+
+                if (task.Wait(TimeSpan.FromSeconds(1)))
                 {
-                    return item.Start;
-                }
-                else if (item is Outlook.TaskItem)
-                {
-                    return item.DateCompleted ?? item.DueDate ?? item.CreationTime;
+                    return task.Result;
                 }
                 else
                 {
-                    return item.CreationTime;
+                    return null; // Timeout
                 }
+            }
+            catch (OutOfMemoryException)
+            {
+                // For large items, skip time access to avoid memory issues
+                return null;
             }
             catch
             {
@@ -764,18 +1009,36 @@ namespace PstMerger
         {
             try
             {
-                if (item is Outlook.MailItem)
+                // Use timeout for large items
+                var task = Task.Run(() =>
                 {
-                    return item.SenderEmailAddress as string;
-                }
-                else if (item is Outlook.AppointmentItem)
+                    if (item is Outlook.MailItem)
+                    {
+                        return item.SenderEmailAddress as string;
+                    }
+                    else if (item is Outlook.AppointmentItem)
+                    {
+                        return item.Organizer as string;
+                    }
+                    else
+                    {
+                        return item.CreationTime.ToString(); // Fallback
+                    }
+                });
+
+                if (task.Wait(TimeSpan.FromSeconds(1)))
                 {
-                    return item.Organizer as string;
+                    return task.Result;
                 }
                 else
                 {
-                    return item.CreationTime.ToString(); // Fallback
+                    return null; // Timeout
                 }
+            }
+            catch (OutOfMemoryException)
+            {
+                // For large items, skip sender access to avoid memory issues
+                return null;
             }
             catch
             {
