@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
 using Outlook = Microsoft.Office.Interop.Outlook;
@@ -16,6 +18,42 @@ namespace PstMerger
         // Optimize: Use parallel processing with controlled concurrency
         private const int MaxConcurrentPstFiles = 3; // Process up to 3 PST files simultaneously
         private const int MaxConcurrentItemsPerFolder = 5; // Copy up to 5 items concurrently per folder
+
+        private void EnsurePstOwnershipAndFullControl(string path, Action<int, string> onProgress)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                    return;
+
+                var fileInfo = new FileInfo(path);
+                if (fileInfo.IsReadOnly)
+                {
+                    fileInfo.IsReadOnly = false;
+                    onProgress(-1, "Removed read-only attribute from " + path);
+                }
+
+                var currentUser = WindowsIdentity.GetCurrent();
+                if (currentUser == null)
+                    return;
+
+                var security = fileInfo.GetAccessControl();
+                security.SetOwner(currentUser.User);
+                var rule = new FileSystemAccessRule(currentUser.User,
+                    FileSystemRights.FullControl, AccessControlType.Allow);
+
+                bool modified = false;
+                security.ModifyAccessRule(AccessControlModification.Set, rule, out modified);
+                if (modified)
+                    fileInfo.SetAccessControl(security);
+
+                onProgress(-1, "Ensured ownership and full control for " + path);
+            }
+            catch (Exception ex)
+            {
+                onProgress(-1, "Warning: could not set permissions for " + path + ", continue: " + ex.Message);
+            }
+        }
 
         public async Task MergeFilesAsync(string[] sourceFiles, string destinationPst, System.Threading.CancellationToken ct, Action<int, string> onProgress)
         {
@@ -35,7 +73,14 @@ namespace PstMerger
                 if (outlookApp == null || ns == null)
                     throw new Exception("Failed to initialize Outlook application");
 
-                // 1. Ensure the destination PST exists or create it
+                // 1. Ensure destination and source PST permissions/ownership are correct
+                EnsurePstOwnershipAndFullControl(destinationPst, onProgress);
+                foreach (var source in sourceFiles)
+                {
+                    EnsurePstOwnershipAndFullControl(source, onProgress);
+                }
+
+                // 2. Ensure the destination PST exists or create it
                 if (!File.Exists(destinationPst))
                 {
                     onProgress(0, "Creating destination PST...");
@@ -529,18 +574,28 @@ namespace PstMerger
                 try
                 {
                     item = sourceItems[itemIndex];
-                    
+                    dynamic dynItem = item;
+
+                    string currentItem = GetItemSubject(dynItem) ?? "<No Subject>";
+                    onProgress(-2, string.Format("Copying item #{0} in {1}: {2}", itemIndex, folderName, currentItem));
+
+                    // Check for duplicates before copying
+                    if (await IsDuplicateItemAsync(dynItem, destFolder, ct))
+                    {
+                        onProgress(-2, string.Format("Skipping duplicate item #{0} in {1}: {2}", itemIndex, folderName, currentItem));
+                        return; // Skip this item
+                    }
+
                     // Attempt to copy item (retry on transient errors only)
                     int maxRetries = 2;
                     Exception lastException = null;
-                    
+
                     for (int attempt = 1; attempt <= maxRetries; attempt++)
                     {
                         Exception delayEx = null;
                         try
                         {
                             // We copy and then move to preserve the source PST in case of failure
-                            dynamic dynItem = item;
                             copy = dynItem.Copy();
                             copy.Move(destFolder);
                             break; // Success
@@ -552,17 +607,17 @@ namespace PstMerger
                             bool isAccessDenied = ex.Message.Contains("permission") || ex.Message.Contains("denied") || ex.HResult == -2147024891;
                             if (isAccessDenied)
                             {
-                                string accessMsg = string.Format("ACCESS DENIED: Failed to copy item in folder {0}: {1} [HResult: {2}]", 
+                                string accessMsg = string.Format("ACCESS DENIED: Failed to copy item in folder {0}: {1} [HResult: {2}]",
                                     folderName, ex.Message, ex.HResult);
                                 if (ex.InnerException != null)
                                     accessMsg += "\n  Inner: " + ex.InnerException.Message;
                                 onProgress(-1, accessMsg);
                                 throw;
                             }
-                            
+
                             if (attempt == maxRetries)
                                 throw;
-                            
+
                             delayEx = ex;
                         }
                         if (delayEx != null && attempt < maxRetries)
@@ -571,7 +626,7 @@ namespace PstMerger
                 }
                 catch (Exception ex)
                 {
-                    string warningMsg = string.Format("Warning: Failed to copy item #{0} in {1}: {2}", 
+                    string warningMsg = string.Format("Warning: Failed to copy item #{0} in {1}: {2}",
                         itemIndex, folderName, ex.Message);
                     if (ex.InnerException != null)
                         warningMsg += "\n  Inner: " + ex.InnerException.Message;
@@ -579,12 +634,12 @@ namespace PstMerger
                 }
                 finally
                 {
-                    if (copy != null) 
+                    if (copy != null)
                     {
                         try { Marshal.ReleaseComObject(copy); }
                         catch { }
                     }
-                    if (item != null) 
+                    if (item != null)
                     {
                         try { Marshal.ReleaseComObject(item); }
                         catch { }
@@ -594,6 +649,137 @@ namespace PstMerger
             finally
             {
                 semaphore.Release();
+            }
+        }
+
+        private async Task<bool> IsDuplicateItemAsync(dynamic sourceItem, Outlook.Folder destFolder, System.Threading.CancellationToken ct)
+        {
+            try
+            {
+                // Get key properties from source item
+                string subject = GetItemSubject(sourceItem);
+                DateTime? receivedTime = GetItemReceivedTime(sourceItem);
+                string senderEmail = GetItemSenderEmail(sourceItem);
+
+                if (string.IsNullOrEmpty(subject))
+                    return false; // Can't check duplicates without subject
+
+                // Check existing items in destination folder
+                Outlook.Items destItems = destFolder.Items;
+                try
+                {
+                    // Use Restrict method to filter items efficiently
+                    string filter = string.Format("[Subject] = '{0}'", subject.Replace("'", "''"));
+                    Outlook.Items filteredItems = destItems.Restrict(filter);
+
+                    try
+                    {
+                        foreach (dynamic destItem in filteredItems)
+                        {
+                            if (ct.IsCancellationRequested)
+                                return false;
+
+                            try
+                            {
+                                // Check if this is likely the same item
+                                string destSubject = GetItemSubject(destItem);
+                                DateTime? destReceivedTime = GetItemReceivedTime(destItem);
+                                string destSenderEmail = GetItemSenderEmail(destItem);
+
+                                // Consider it a duplicate if subject, sender, and received time match (within 1 minute)
+                                if (string.Equals(subject, destSubject, StringComparison.OrdinalIgnoreCase) &&
+                                    string.Equals(senderEmail, destSenderEmail, StringComparison.OrdinalIgnoreCase) &&
+                                    receivedTime.HasValue && destReceivedTime.HasValue &&
+                                    Math.Abs((receivedTime.Value - destReceivedTime.Value).TotalMinutes) < 1)
+                                {
+                                    return true; // Found duplicate
+                                }
+                            }
+                            finally
+                            {
+                                Marshal.ReleaseComObject(destItem);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.ReleaseComObject(filteredItems);
+                    }
+                }
+                finally
+                {
+                    Marshal.ReleaseComObject(destItems);
+                }
+
+                return false; // No duplicate found
+            }
+            catch
+            {
+                // If duplicate checking fails, err on the side of caution and allow the copy
+                return false;
+            }
+        }
+
+        private string GetItemSubject(dynamic item)
+        {
+            try
+            {
+                return item.Subject as string;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private DateTime? GetItemReceivedTime(dynamic item)
+        {
+            try
+            {
+                // Try different properties depending on item type
+                if (item is Outlook.MailItem)
+                {
+                    return item.ReceivedTime;
+                }
+                else if (item is Outlook.AppointmentItem)
+                {
+                    return item.Start;
+                }
+                else if (item is Outlook.TaskItem)
+                {
+                    return item.DateCompleted ?? item.DueDate ?? item.CreationTime;
+                }
+                else
+                {
+                    return item.CreationTime;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private string GetItemSenderEmail(dynamic item)
+        {
+            try
+            {
+                if (item is Outlook.MailItem)
+                {
+                    return item.SenderEmailAddress as string;
+                }
+                else if (item is Outlook.AppointmentItem)
+                {
+                    return item.Organizer as string;
+                }
+                else
+                {
+                    return item.CreationTime.ToString(); // Fallback
+                }
+            }
+            catch
+            {
+                return null;
             }
         }
 
@@ -608,6 +794,68 @@ namespace PstMerger
                 Marshal.ReleaseComObject(f);
             }
             return null;
+        }
+
+        private bool IsDuplicateMessage(Outlook.Folder destFolder, object sourceItem)
+        {
+            if (sourceItem == null || destFolder == null)
+                return false;
+
+            try
+            {
+                var mailItem = sourceItem as Outlook.MailItem;
+                if (mailItem == null)
+                    return false;
+
+                string messageId = string.Empty;
+                try
+                {
+                    const string PR_INTERNET_MESSAGE_ID = "http://schemas.microsoft.com/mapi/proptag/0x1035001F";
+                    object prop = mailItem.PropertyAccessor.GetProperty(PR_INTERNET_MESSAGE_ID);
+                    if (prop is string)
+                        messageId = (string)prop;
+                }
+                catch { }
+
+                if (!string.IsNullOrWhiteSpace(messageId))
+                {
+                    var filter = string.Format("[InternetMessageID] = '{0}'", EscapeOutlookFilter(messageId));
+                    Outlook.Items found = null;
+                    try
+                    {
+                        found = destFolder.Items.Restrict(filter);
+                        if (found != null && found.Count > 0)
+                            return true;
+                    }
+                    finally
+                    {
+                        if (found != null) Marshal.ReleaseComObject(found);
+                    }
+                }
+
+                var sub = mailItem.Subject ?? string.Empty;
+                var received = mailItem.ReceivedTime;
+                var quickFilter = string.Format("[Subject] = '{0}' AND [ReceivedTime] = '{1:yyyy-MM-dd HH:mm:ss}'", EscapeOutlookFilter(sub), received);
+                Outlook.Items matches = null;
+                try
+                {
+                    matches = destFolder.Items.Restrict(quickFilter);
+                    return matches != null && matches.Count > 0;
+                }
+                finally
+                {
+                    if (matches != null) Marshal.ReleaseComObject(matches);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string EscapeOutlookFilter(string value)
+        {
+            return value.Replace("'", "''").Replace("\\", "\\\\");
         }
 
         private Outlook.Folder GetRootFolder(Outlook.NameSpace ns, string filePath, Action<int, string> onProgress)

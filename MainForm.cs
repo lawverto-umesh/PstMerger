@@ -57,9 +57,10 @@ namespace PstMerger
         {
             try
             {
+                // Clean up the service instance
                 if (_pstService != null)
                 {
-                    System.Runtime.InteropServices.Marshal.ReleaseComObject(_pstService);
+                    _pstService = null;
                 }
             }
             catch (Exception ex)
@@ -218,13 +219,19 @@ namespace PstMerger
                 var mergeTask = System.Threading.Tasks.Task.Run(async () =>
                 {
                     await _pstService.MergeFilesAsync(pstFiles, destFile, _cts.Token, (progress, message) =>
+                {
+                    this.Invoke(new Action(() =>
                     {
-                        this.Invoke(new Action(() =>
+                        if (progress == -2)
                         {
-                            Log(message);
-                            if (progress > 0) progressBar.Value = Math.Min(progress, progressBar.Maximum);
-                        }));
-                    });
+                            SetCurrentCopyStatus(message);
+                            return;
+                        }
+
+                        Log(message);
+                        if (progress > 0) progressBar.Value = Math.Min(progress, progressBar.Maximum);
+                    }));
+                });
                 });
 
                 await mergeTask;
@@ -314,6 +321,27 @@ namespace PstMerger
                 {
                     return; // User cancelled
                 }
+            }
+        }
+
+        private void SetCurrentCopyStatus(string message)
+        {
+            try
+            {
+                if (txtCurrentCopy.InvokeRequired)
+                {
+                    txtCurrentCopy.Invoke(new Action(() => SetCurrentCopyStatus(message)));
+                    return;
+                }
+
+                string line = string.Format("[{0:HH:mm:ss}] {1}", DateTime.Now, message);
+                txtCurrentCopy.AppendText(line + Environment.NewLine);
+                txtCurrentCopy.SelectionStart = txtCurrentCopy.Text.Length;
+                txtCurrentCopy.ScrollToCaret();
+            }
+            catch
+            {
+                // keep going even if current copy update fails
             }
         }
 

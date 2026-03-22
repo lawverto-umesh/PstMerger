@@ -28,6 +28,8 @@ namespace PstMerger
             this.progressBar = new System.Windows.Forms.ProgressBar();
             this.txtLog = new System.Windows.Forms.TextBox();
             this.label3 = new System.Windows.Forms.Label();
+            this.label4 = new System.Windows.Forms.Label();
+            this.txtCurrentCopy = new System.Windows.Forms.TextBox();
             this.SuspendLayout();
             // 
             // label1
@@ -144,7 +146,7 @@ namespace PstMerger
             this.txtLog.Name = "txtLog";
             this.txtLog.ReadOnly = true;
             this.txtLog.ScrollBars = System.Windows.Forms.ScrollBars.Vertical;
-            this.txtLog.Size = new System.Drawing.Size(546, 250);
+            this.txtLog.Size = new System.Drawing.Size(546, 180);
             this.txtLog.TabIndex = 9;
             // 
             // label3
@@ -156,13 +158,36 @@ namespace PstMerger
             this.label3.TabIndex = 10;
             this.label3.Text = "Log:";
             // 
+            // label4
+            // 
+            this.label4.AutoSize = true;
+            this.label4.Location = new System.Drawing.Point(12, 378);
+            this.label4.Name = "label4";
+            this.label4.Size = new System.Drawing.Size(82, 13);
+            this.label4.TabIndex = 11;
+            this.label4.Text = "Current Copy:";
+            // 
+            // txtCurrentCopy
+            // 
+            this.txtCurrentCopy.BackColor = System.Drawing.Color.Black;
+            this.txtCurrentCopy.ForeColor = System.Drawing.Color.Cyan;
+            this.txtCurrentCopy.Location = new System.Drawing.Point(15, 394);
+            this.txtCurrentCopy.Multiline = true;
+            this.txtCurrentCopy.Name = "txtCurrentCopy";
+            this.txtCurrentCopy.ReadOnly = true;
+            this.txtCurrentCopy.ScrollBars = System.Windows.Forms.ScrollBars.Vertical;
+            this.txtCurrentCopy.Size = new System.Drawing.Size(546, 120);
+            this.txtCurrentCopy.TabIndex = 12;
+            // 
             // MainForm
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(584, 461);
+            this.ClientSize = new System.Drawing.Size(584, 540);
             this.Controls.Add(this.btnAbout);
             this.Controls.Add(this.btnCancel);
+            this.Controls.Add(this.label4);
+            this.Controls.Add(this.txtCurrentCopy);
             this.Controls.Add(this.label3);
             this.Controls.Add(this.txtLog);
             this.Controls.Add(this.progressBar);
@@ -196,5 +221,7 @@ namespace PstMerger
         private System.Windows.Forms.ProgressBar progressBar;
         private System.Windows.Forms.TextBox txtLog;
         private System.Windows.Forms.Label label3;
+        private System.Windows.Forms.Label label4;
+        private System.Windows.Forms.TextBox txtCurrentCopy;
     }
 }
