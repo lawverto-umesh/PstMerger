@@ -100,6 +100,13 @@ HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Outlook\PST
 
 Setting `MaxLargeFileSize` and `WarnLargeFileSize` to ~2TB.
 
+
+## Outlook Repair Tool
+
+Location `C:\Program Files\Microsoft Office\root\Office16\SCANPST.EXE`
+
+[Instructions](https://support.microsoft.com/en-gb/office/repair-outlook-data-files-pst-and-ost-25663bc3-11ec-4412-86c4-60458afc5253)
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) file.

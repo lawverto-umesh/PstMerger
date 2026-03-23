@@ -278,7 +278,8 @@ namespace PstMerger
             await semaphore.WaitAsync(ct); // Control concurrency
             try
             {
-                onProgress(fileIndex, string.Format("Merging: {0}", Path.GetFileName(filePath)));
+                // Log the start of processing but don't update progress bar yet
+                onProgress(-1, string.Format("Merging: {0}", Path.GetFileName(filePath)));
 
                 Outlook.Folder sourceRoot = null;
                 try
@@ -328,6 +329,9 @@ namespace PstMerger
                     try { ns.RemoveStore(sourceRoot); }
                     catch { }
                     Marshal.ReleaseComObject(sourceRoot);
+                    
+                    // Update progress AFTER file has been successfully merged
+                    onProgress(fileIndex, string.Format("Completed: {0}", Path.GetFileName(filePath)));
                 }
                 catch (Exception ex)
                 {
@@ -751,7 +755,7 @@ namespace PstMerger
                                     _totalLargeItemsHandled++;
                                     break;
                                 }
-                                catch (Exception directMoveEx)
+                                catch (Exception)
                                 {
                                     // Direct move failed, try alternative strategies outside catch block
                                     lastException = oomEx;
